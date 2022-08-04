@@ -1,0 +1,146 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r Packages, include=F}
+library(plyr)
+library(dplyr)
+library(ggplot2)
+library(scales)
+library(tidyr)
+library(stringr)
+```
+
+# Set file names
+```{r}
+INPUT <- "Filter1_Haplotypes.csv"
+OUTPUT <- "Filter1_Haplotypes_MAFs.csv"
+```
+
+# General processing of input file and saving lists of loci and country+site+year info
+```{r}
+# Read file but remove row index (first column)
+global_SNPs_df <- read.csv(INPUT)[,-1]
+
+# Replace 'X' with 'NA'
+global_SNPs_df <- na_if(global_SNPs_df, "X")
+
+# Save combinations of metadata (e.g., country, year, site)
+global_SNPs_df_summary <- global_SNPs_df %>% group_by(Country, Year, Site) %>% dplyr::summarise(n = n())
+
+# Save list of loci
+drop_cols <- c('Sample', 'Study', 'Site', 'Country', 'Year', 'ENA', 'Population', 'X..callable', 'QC.pass', 'Is.returning.traveller')
+loci_list <- global_SNPs_df %>% dplyr::select(-one_of(drop_cols)) %>% colnames()
+```
+
+# 1. Count the number of MACs (heterozygote calls) & n (total) per locus
+# 2. Counting the Major and Minor alleles per locus 
+# 3. Tabulate the minor allele frequencies for each locus
+```{r}
+# Initialize df for MAFs of ALL country+site+year
+global_SNPs_df_MAF.FINAL <- data.frame()
+
+# Loop through rows in the df
+for (row in 1:nrow(global_SNPs_df_summary)) {
+  # Save info as variables
+  country_var <- global_SNPs_df_summary[row, "Country"]$Country
+  year_var  <- global_SNPs_df_summary[row, "Year"]$Year
+  site_var <- global_SNPs_df_summary[row, "Site"]$Site
+    
+  # Subset dataset to have only genotypes of samples from the specific country, site and year of interest
+  global_SNPs_df_sub <- global_SNPs_df %>% dplyr::filter(Country==country_var & Site==site_var & Year==year_var)
+
+  # Counts number of MACs in dataset
+  global_SNPs_df_sub_MAC <- as.data.frame(global_SNPs_df_sub %>% dplyr::select(Sample, Country, Site, Year, all_of(loci_list)) %>%
+                                   summarise(across(loci_list, ~ sum(.x=="N", na.rm = T))) %>%
+                                   t())
+  # Rename new column
+  names(global_SNPs_df_sub_MAC)[names(global_SNPs_df_sub_MAC) == 'V1'] <- 'MAC (Multiclonal)'
+
+  # Counts number of total samples in the dataset
+  global_SNPs_df_sub_n <- as.data.frame(global_SNPs_df_sub %>% dplyr::select(Sample, Country, Site, Year, all_of(loci_list)) %>%
+                                   summarise(across(loci_list, ~ sum(!is.na(.x)))) %>%
+                                   t())
+
+  # Rename new column
+  names(global_SNPs_df_sub_n)[names(global_SNPs_df_sub_n) == 'V1'] <- 'n'
+  
+  # Initialize df for MAFs of specific country+site+year
+  global_SNPs_df_sub.MAFs <- data.frame()
+  
+  for (locus in loci_list) {
+    # Print run progress (optional or for debugging)
+    # print(paste("Processing ", country_var, "/", site_var, "/", year_var, " isolates for locus ", locus, sep=""))
+      
+    df <- global_SNPs_df_sub %>% dplyr::select(Country, Site, Year, locus) %>% #select locus of interest, survey (+ country/site/year) and all isolates involved
+      drop_na %>% #Remove na's present in code
+      group_by(Country, Site, Year, .dots = locus) %>% #group by survey (+ country/site/year) and locus so that it calculates the appropriate frequency
+      dplyr::summarise(n = n()) %>% # summarise the number of different variables
+      mutate(Freq = round(prop.table(n), 3)) %>% #Round the total frequency of these variables in this column to 3
+      dplyr::select(-n) #remove 'n'
+    
+    names(df)[names(df) == locus] <- 'Base' # Rename column
+    df <- df %>% dplyr::filter(df$Base != "N") #Remove the N (heterozygote calls)
+    df$Locus <- locus #Generate new column LOCUS and add the locus name A2 
+
+    # Combine alleles with identical frequencies
+    df <- df %>% group_by(Country, Site, Year, Freq, Locus) %>%
+      summarise(Alleles = str_c(Base, collapse="/")) %>%
+      ungroup()
+      
+    if (nrow(df) > 1) { # if more than one allele (>=2)
+      # Save major allele as variable
+      major_allele <- df %>% dplyr::filter(Freq == max(df$Freq)) %>% dplyr::select(Alleles) %>% as.character()
+      # Save minor allele and frequencies
+      minor_info <- df %>% dplyr::filter(Freq < max(df$Freq)) %>% # Combine frequencies and alleles less than major freq
+        group_by(Country, Site, Year, Locus) %>%
+        summarise(Freq = str_c(Freq, collapse="/"),
+                  Alleles = str_c(Alleles, collapse="/")) %>%
+        ungroup()
+      
+      minor_freq <- minor_info %>% dplyr::select(Freq) %>% as.character() # Save minor allele frequency as variable
+      minor_allele <- minor_info %>% dplyr::select(Alleles) %>% as.character() # Save minor allele as variable
+      
+      rm(minor_info)  # remove tmp variable
+      
+    } else if (nrow(df) == 1) { # if only one allele
+      # Save major allele as variable
+      major_allele <- df %>% dplyr::filter(Freq == max(df$Freq)) %>% dplyr::select(Alleles) %>% as.character()
+      # Assign minor allele and frequencies
+      minor_freq <- "0"
+      minor_allele <- "-"
+    } else {  # if no alleles
+      # Assign everything "NA"
+      major_allele <- "NA"
+      minor_allele <- "NA"
+      minor_freq <- "NA"
+    }
+
+    # Create new data frame
+    df_new <- data.frame(country_var, site_var, year_var, locus, major_allele, minor_allele, minor_freq)
+    colnames(df_new) <- c("Country", "Site", "Year", "Locus", "Major Allele", "Minor Allele", "Minor Allele Frequency")
+    
+    # Reporting: add to MAF data frame
+    global_SNPs_df_sub.MAFs <- bind_rows(global_SNPs_df_sub.MAFs, df_new)
+    
+    # Delete temporary variables
+    rm(df, df_new, major_allele, minor_freq, minor_allele)
+  }
+
+  # Bind two columns containing MACs and n's
+  global_SNPs_df_sub.MAFs <- bind_cols(global_SNPs_df_sub.MAFs, global_SNPs_df_sub_MAC, global_SNPs_df_sub_n)
+
+  # Ordering the rows
+  global_SNPs_df_sub.MAFs <- global_SNPs_df_sub.MAFs %>% dplyr::select(Country, Site, Year, Locus, n, `MAC (Multiclonal)`, `Major Allele`, `Minor Allele`, `Minor Allele Frequency`) 
+
+  # Add to final MAF data frame
+  global_SNPs_df_MAF.FINAL <- rbind(global_SNPs_df_MAF.FINAL, global_SNPs_df_sub.MAFs)
+  
+  # Delete temporary variables
+  rm(global_SNPs_df_sub.MAFs)
+}
+
+# Saving in file
+write.csv(global_SNPs_df_MAF.FINAL, OUTPUT)
+```
